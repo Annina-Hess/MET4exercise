@@ -1,0 +1,441 @@
+---
+title: "PosterProject_19750843"
+author: "19-750-843"
+date: "2025-04-23"
+output: pdf
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set up
+```{r}
+library(haven)
+library(readxl)
+library(dplyr)
+library(tidyverse)
+library(caret)
+library(tidymodels)
+library(ranger)
+library(corrplot)
+library(vip)
+library(ggplot2)
+
+data <- read_dta("swissubase_932_9_0/data/W25_2023/shp23_p_user.dta")
+vars_to_keep <- read_excel("swissubase_932_9_0/health_variables.xlsx") # this excel sheet contains the predictor variables (demographic, employment, health, etc)
+
+```
+
+# Data Prepocessing
+
+p2305 asks:  Let's suppose that there are 10 federal polls in a year. How many do you usually take part in ?
+
+```{r}
+selected_vars <- tolower(vars_to_keep$variable)
+selected_vars <- intersect(selected_vars, names(data)) # ensure that the selected_vars actually exist in the data
+df <- data %>% 
+  select(all_of(selected_vars), p23p06) %>%  # select background variables and the variable with how many elections a person would participate in if there were 10 per year
+  mutate(across(everything(), ~ ifelse(. < 0, NA, .))) %>% # negative values should be NA
+  select(where(~ sum(is.na(.)) < 8000)) %>% # only 36 out of 63 variables have less than 8000 NAs.
+  filter(age23 >= 18) %>% # age below 18 cannot vote anyway
+  drop_na()
+
+dim(df) # check dimensions
+```
+
+# data exploration
+```{r}
+hist(df$age23)
+hist(df$p23p06)
+table(df$p23p06)
+```
+
+# correlation plot
+```{r}
+# 1. Select only numeric columns
+numeric_data <- train_data %>% 
+  select(where(is.numeric))
+
+# 2. Compute the correlation matrix
+cor_matrix <- cor(numeric_data, use = "complete.obs")  # 'complete.obs' = handles missing data safely
+
+# 3. View it
+print(cor_matrix)
+
+# Plot the correlation matrix
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.cex = 0.7, number.cex = 0.7)
+
+```
+
+
+# crossvalidation folds
+```{r}
+set.seed(123)
+data_split <- initial_split(df, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+folds <- vfold_cv(train_data, v = 10)
+```
+
+# OLS without interactions
+Model construction
+```{r}
+ols1 <- lm(p23p06 ~ ., data=train_data)
+
+ols_spec <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+ols_recipe <- recipe(p23p06 ~ ., data = train_data) %>%
+  step_normalize(all_predictors()) 
+
+ols_workflow <- workflow() %>%
+  add_model(ols_spec) %>%
+  add_recipe(ols_recipe)
+
+ols_cv_results <- fit_resamples(
+  ols_workflow,
+  resamples = folds,
+  control = control_resamples(save_pred = TRUE)
+)
+
+# Final OLS model fit on full train_data
+final_ols_fit <- fit(ols_workflow, data = train_data)
+
+
+```
+
+Evaluating OLS results
+```{r}
+preds_test <- predict(final_ols_fit, new_data = test_data)
+
+# Actual and predicted
+actuals <- test_data$p23p06
+predicted <- preds_test$.pred  # watch the .$pred structure here!
+
+# Mean Squared Error (MSE)
+mse <- mean((actuals - predicted)^2)
+print(mse)
+
+# Mean Absolute Error (MAE)
+mae <- mean(abs(actuals - predicted))
+print(mae)
+
+# R squared (manual)
+ss_total <- sum((actuals - mean(actuals))^2)
+ss_resid <- sum((actuals - predicted)^2)
+r2_value <- 1 - (ss_resid / ss_total)
+print(r2_value)
+```
+
+# OLS with interactions
+```{r}
+# recipe with interactions
+ols_recipe_interacted <- recipe(p23p06 ~ ., data = train_data) %>%
+  step_interact(terms = ~ all_predictors():all_predictors()) %>%
+  step_normalize(all_predictors())
+
+ols_workflow_interacted <- workflow() %>%
+  add_model(ols_spec) %>%
+  add_recipe(ols_recipe_interacted)
+
+final_ols_fit_interacted <- fit(ols_workflow_interacted, data = train_data)
+
+preds_test <- predict(final_ols_fit_interacted, new_data = test_data)
+
+actuals <- test_data$p23p06
+predicted <- preds_test$.pred  
+
+mse <- mean((actuals - predicted)^2)
+print(mse)
+
+mae <- mean(abs(actuals - predicted))
+print(mae)
+
+ss_total <- sum((actuals - mean(actuals))^2)
+ss_resid <- sum((actuals - predicted)^2)
+r2_value <- 1 - (ss_resid / ss_total)
+print(r2_value)
+
+```
+
+```{r}
+ggplot(data.frame(actual = actuals, predicted = preds_test), aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(color = "red", linetype = "dashed") +
+  labs(title = "Predicted vs Actual", x = "Actual", y = "Predicted") +
+  theme_minimal()
+```
+
+
+# Lasso regression without interactions
+
+```{r}
+x <- model.matrix(p23p06 ~ ., data = train_data)[, -1]
+y <- train_data$p23p06
+
+cv_lasso <- cv.glmnet( # defines grid automatically
+  x, y,
+  alpha = 1,            # Lasso (alpha = 0 is Ridge)
+  nfolds = 5,           # 5-fold cross-validation
+  standardize = TRUE    # standardizes predictors internally
+)
+
+cv_lasso$lambda.min   # best lambda based on CV
+cv_lasso$lambda.1se 
+
+plot(cv_lasso)
+
+x_test <- model.matrix(p23p06 ~ ., data = test_data)[, -1]  # same formula, new data
+
+# 4. Predict on test data
+preds_test <- predict(cv_lasso, s = cv_lasso$lambda.min, newx = x_test)
+preds_test <- as.numeric(preds_test)
+
+# 5. Evaluate
+actuals <- test_data$p23p06
+
+# Mean Squared Error (MSE)
+mse <- mean((actuals - preds_test)^2)
+print(mse)
+
+# Mean Absolute Error (MAE)
+mae <- mean(abs(actuals - preds_test))
+print(mae)
+
+# R squared (manual)
+ss_total <- sum((actuals - mean(actuals))^2)
+ss_resid <- sum((actuals - preds_test)^2)
+r2_value <- 1 - (ss_resid / ss_total)
+print(r2_value)
+
+```
+
+# Lasso with interactions
+```{r}
+x <- model.matrix(p23p06 ~ (.)^2, data = train_data)[, -1]
+
+# Response variable
+y <- train_data$p23p06
+
+cv_lasso <- cv.glmnet(
+  x, y,
+  alpha = 1,            # Lasso (alpha = 0 is Ridge)
+  nfolds = 5,           # 5-fold cross-validation
+  standardize = TRUE    # standardizes predictors internally
+)
+
+cv_lasso$lambda.min   # best lambda based on CV
+cv_lasso$lambda.1se 
+
+plot(cv_lasso)
+
+x_test <- model.matrix(p23p06 ~ (.)^2, data = test_data)[, -1]  # <-- interactions!
+
+# 4. Predict on test data
+preds_test <- predict(cv_lasso, s = cv_lasso$lambda.min, newx = x_test)
+preds_test <- as.numeric(preds_test)
+
+# 5. Evaluate
+actuals <- test_data$p23p06
+
+# Mean Squared Error (MSE)
+mse <- mean((actuals - preds_test)^2)
+print(mse)
+
+# Mean Absolute Error (MAE)
+mae <- mean(abs(actuals - preds_test))
+print(mae)
+
+# R squared (manual)
+ss_total <- sum((actuals - mean(actuals))^2)
+ss_resid <- sum((actuals - preds_test)^2)
+r2_value <- 1 - (ss_resid / ss_total)
+print(r2_value)
+
+
+```
+```{r}
+plot(cv_lasso)  # plots MSE vs. log(lambda)
+
+```
+
+```{r}
+ggplot(data.frame(actual = actuals, predicted = preds_test), aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(color = "red", linetype = "dashed") +
+  labs(title = "Predicted vs Actual", x = "Actual", y = "Predicted") +
+  theme_minimal()
+```
+
+
+# Random Forest
+```{r}
+
+# Define random forest model
+rf_spec <- rand_forest(
+  mode = "regression",
+  mtry = 10,            # you can tune this later!
+  trees = 500,
+  min_n = 5
+) %>%
+  set_engine("ranger", importance = "impurity")
+
+# Create recipe
+rf_recipe <- recipe(p23p06 ~ ., data = train_data) %>%
+  step_normalize(all_numeric_predictors())
+
+# Create workflow
+rf_workflow <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(rf_recipe)
+
+# Cross-validation folds
+set.seed(123)
+folds <- vfold_cv(train_data, v = 5)
+
+# Fit model across folds
+rf_cv_results <- fit_resamples(
+  rf_workflow,
+  resamples = folds,
+  control = control_resamples(save_pred = TRUE)
+)
+
+# 6. Final fit on full train data
+final_rf_fit <- fit(rf_workflow, data = train_data)
+
+```
+
+```{r}
+preds_test <- predict(final_rf_fit, new_data = test_data)
+
+# 8. Calculate performance on test set
+actuals <- test_data$p23p06
+predicted <- preds_test$.pred  # be careful to use .$pred!
+
+# Mean Squared Error (MSE)
+mse <- mean((actuals - predicted)^2)
+print(mse)
+
+# Mean Absolute Error (MAE)
+mae <- mean(abs(actuals - predicted))
+print(mae)
+
+# R squared (manual)
+ss_total <- sum((actuals - mean(actuals))^2)
+ss_resid <- sum((actuals - predicted)^2)
+r2_value <- 1 - (ss_resid / ss_total)
+print(r2_value)
+```
+
+# RF with tuning
+```{r}
+
+set.seed(123)
+
+# 1. Create 5-fold cross-validation on TRAIN data
+folds <- vfold_cv(train_data, v = 5)
+
+# 2. Define Random Forest model, mtry and min_n to tune
+rf_spec <- rand_forest(
+  mode = "regression",
+  mtry = tune(),
+  min_n = tune(),
+  trees = 500
+) %>%
+  set_engine("ranger", importance = "impurity")
+
+# 3. Create a recipe (normalization)
+rf_recipe <- recipe(p23p06 ~ ., data = train_data) %>%
+  step_normalize(all_numeric_predictors())
+
+# 4. Combine model + recipe into a workflow
+rf_workflow <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(rf_recipe)
+
+# 5. Define grid to tune over
+rf_grid <- grid_regular(
+  mtry(range = c(2, 20)),
+  min_n(range = c(2, 20)),
+  levels = 5
+)
+
+# 6. Tune the model using CV folds
+rf_tune_results <- tune_grid(
+  rf_workflow,
+  resamples = folds,
+  grid = rf_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+# 7. Select best hyperparameters based on RMSE
+best_rf <- select_best(rf_tune_results, metric = "rmse")
+print(best_rf)
+
+# 8. Finalize the workflow with the best hyperparameters
+final_rf_workflow <- finalize_workflow(
+  rf_workflow,
+  best_rf
+)
+
+# 9. Fit the finalized model on full train_data
+final_rf_fit <- fit(final_rf_workflow, data = train_data)
+
+# 10. Predict on test_data
+preds_test <- predict(final_rf_fit, new_data = test_data)
+
+# 11. Calculate test set performance
+actuals <- test_data$p23p06
+predicted <- preds_test$.pred
+
+# Mean Squared Error (MSE)
+mse_rf <- mean((actuals - predicted)^2)
+print(mse_rf)
+
+# Mean Absolute Error (MAE)
+mae_rf <- mean(abs(actuals - predicted))
+print(mae_rf)
+
+# R squared (manual)
+ss_total <- sum((actuals - mean(actuals))^2)
+ss_resid <- sum((actuals - predicted)^2)
+r2_rf <- 1 - (ss_resid / ss_total)
+print(r2_rf)
+```
+```{r}
+vip(final_rf_fit)  # after fitting your finalized random forest
+
+```
+```{r}
+library(vip)
+
+vip(final_rf_fit, num_features = 20, aesthetics = list(fill = "skyblue", alpha = 0.8)) +
+  labs(
+    title = "Random Forest Variable Importance",
+    subtitle = "Top 20 Features",
+    x = "Importance (Decrease in MSE)",
+    y = "Features"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14)
+  )
+
+```
+
+
+```{r}
+ggplot(data.frame(actual = actuals, predicted = predicted), aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(color = "red", linetype = "dashed") +
+  labs(title = "Predicted vs Actual", x = "Actual", y = "Predicted") +
+  theme_minimal()
+```
+
