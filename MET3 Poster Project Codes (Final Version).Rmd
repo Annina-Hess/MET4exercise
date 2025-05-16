@@ -1,0 +1,368 @@
+---
+title: "MET3 Final Project Codework"
+authors: "24-934-473, 24-960-734, 24-934-838, 24-937-476"
+output:
+  pdf_document: default
+  html_document: default
+date: "2025-04-21"
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+
+library(knitr)
+opts_chunk$set(cache=TRUE, autodep = TRUE)
+
+options(htmltools.dir.version = FALSE)
+options(scipen = 999)
+
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(haven)
+library(foreign)
+library(MSCMT)
+library(parallel)
+
+wdi <-read.csv("wdi_90-24_2.csv")
+
+```
+
+## Filtering codes
+
+```{r}
+# Filter by targeted group and variable
+## Replace NAs and change labels
+yr_lbl <- c(
+  "YR1990" = "1990", "YR1991" = "1991", "YR1992" = "1992",
+  "YR1993" = "1993", "YR1994" = "1994", "YR1995" = "1995", 
+  "YR1996" = "1996", "YR1997" = "1997", "YR1998" = "1998",
+  "YR1999" = "1999", "YR2000" = "2000", "YR2001" = "2001",
+  "YR2002" = "2002", "YR2003" = "2003", "YR2004" = "2004",
+  "YR2005" = "2005", "YR2006" = "2006", "YR2007" = "2007",
+  "YR2008" = "2008", "YR2009" = "2009", "YR2010" = "2010",
+  "YR2011" = "2011", "YR2012" = "2012", "YR2013" = "2013",
+  "YR2014" = "2014", "YR2015" = "2015", "YR2016" = "2016",
+  "YR2017" = "2017", "YR2018" = "2018", "YR2019" = "2019",
+  "YR2020" = "2020", "YR2021" = "2021", "YR2022" = "2022",
+  "YR2023" = "2023", "YR2024" = "2024"
+)
+cntry_lbl <- c(
+  "ALB" = "Albania", "ARG" = "Argentina", "AUS" = "Australia",
+  "XKX" = "Kosovo", "MKD" = "North Macedonia", "BRA" = "Brazil",
+  "CHE" = "Switzerland", "EGY" = "Egypt", "TUR" = "Turkey",
+  "ISL" = "Iceland", "NZL" = "New Zealand", "HRV" = "Croatia",
+  "ISR" = "Israel", "CHN" = "China", "HKG" = "Hong Kong",
+  "TUN" = "Tunisia", "GEO" = "Georgia", "UKR" = "Ukraine",
+  "SRB" = "Serbia", "MDA" = "Moldova", "SGP" = "Singapore",
+  "URY" = "Uruguay", "MEX" = "Mexico", "CHL" = "Chile",
+  "VNM" = "Vietnam", "GRL" = "Greenland", "IDN" = "Indonesia",
+  "MYS" = "Malaysia", "COL" = "Colombia", "BIH" = "Bosnia and Herzegovina"
+)
+wdi <- wdi %>%
+  mutate_all(~ifelse(.x == "..", NA, .x)) %>%
+  mutate_at(3:21, as.numeric) %>%
+  mutate(GV.EXP.LOG = log(NE.CON.GOVT.KD),
+         IND.VAL.LOG = log(NV.IND.TOTL.KD),
+         SRV.VAL.LOG = log(NV.SRV.TOTL.KD),
+         AGR.VAL.LOG = log(NV.AGR.TOTL.KD),
+         NECON.LOG = log(NE.CON.PRVT.KD),
+         POP.LOG = log(SP.POP.TOTL),
+         Year = yr_lbl[Time.Code],
+         Country = cntry_lbl[Country.Code]
+         ) %>%
+  filter(Year != "2024")
+wdi_new <- wdi %>%
+  filter(!Country.Code %in% c("ARG","XKX",
+                      "GRL", "HKG",
+                      "URY","GEO")) %>%
+  select(-c("Time.Code", 
+            "NE.CON.GOVT.KD", "FP.CPI.TOTL",
+            "NV.IND.TOTL.KD", "NV.SRV.TOTL.KD",
+            "NV.AGR.TOTL.KD","NE.CON.PRVT.KD",
+            "SP.POP.TOTL", "SE.XPD.TOTL.GD.ZS",
+            "SH.XPD.CHEX.GD.ZS",))
+```
+
+## Imputing the NAs
+```{r}
+# Create ID number list for the countries
+cntry_id <- c(
+  "ALB" = 1, "AUS" = 2,
+  "MKD" = 3, "BRA" = 4,
+  "CHE" = 5, "EGY" = 6, "TUR" = 7,
+  "ISL" = 8,"HRV" = 9,
+  "ISR" = 10, "CHN" = 11, 
+  "TUN" = 12, "UKR" = 13,
+  "SRB" = 14, "MDA" = 15, "SGP" = 16,
+  "MEX" = 17, "CHL" = 18,
+  "VNM" = 19, "IDN" = 20,
+  "MYS" = 21, "COL" = 22, 
+  "BIH" = 23, "NZL" = 24
+)
+# Define the predictors list
+preds <- c("NY.GDP.MKTP.KD.ZG",
+          "BN.CAB.XOKA.GD.ZS","SL.UEM.TOTL.NE.ZS",
+          "NE.EXP.GNFS.ZS","NE.IMP.GNFS.ZS",
+          "BM.KLT.DINV.WD.GD.ZS","BX.KLT.DINV.WD.GD.ZS",
+          "SL.AGR.EMPL.ZS","SL.IND.EMPL.ZS",
+          "SL.SRV.EMPL.ZS","NY.ADJ.NNTY.PC.KD",
+          "SE.TER.ENRR",
+          "NY.GNS.ICTR.ZS","NE.TRD.GNFS.ZS",
+          "SP.POP.DPND","NE.GDI.FTOT.ZS",
+          "GV.EXP.LOG","IND.VAL.LOG",
+          "SRV.VAL.LOG","AGR.VAL.LOG",
+          "NECON.LOG")
+# Impute the country-level means into the predictors
+wdi_new <- wdi_new %>%
+  mutate(ID = cntry_id[Country.Code]) %>%
+  group_by(Country) %>%
+  mutate(across(all_of(preds), 
+                ~ ifelse(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  ungroup()
+
+
+```
+
+## Examining donor pool
+# Create the pool
+```{r}
+# SC matrice
+wdi_new <- as.data.frame(wdi_new)
+gdpgr.prep <- listFromLong(wdi_new, unit.variable="ID",
+                        time.variable="Year",
+                        unit.names.variable="Country")
+## Define treatment and control identifiers
+treatment.identifiers = "Croatia"
+control.identifiers = unique(wdi_new$Country[wdi_new$Country != treatment.identifiers])
+## Generate covariates
+pre_treat_yrs = c(1990, 1995, 2000, 2003)
+times.dep = cbind("NY.GDP.MKTP.KD.ZG" = pre_treat_yrs)
+times.pred <- cbind(
+  "BN.CAB.XOKA.GD.ZS" = pre_treat_yrs,
+  "SL.UEM.TOTL.NE.ZS" = pre_treat_yrs,
+  "NE.EXP.GNFS.ZS" = pre_treat_yrs,
+  "NE.IMP.GNFS.ZS" = pre_treat_yrs,
+  "BM.KLT.DINV.WD.GD.ZS" = pre_treat_yrs,
+  "BX.KLT.DINV.WD.GD.ZS" = pre_treat_yrs,
+  "SL.AGR.EMPL.ZS"= pre_treat_yrs,
+  "SL.IND.EMPL.ZS"= pre_treat_yrs,
+  "SL.SRV.EMPL.ZS"= pre_treat_yrs,
+  "NY.ADJ.NNTY.PC.KD"= pre_treat_yrs,
+  "SE.TER.ENRR"= pre_treat_yrs,
+  "NY.GNS.ICTR.ZS"= pre_treat_yrs,
+  "NE.TRD.GNFS.ZS"= pre_treat_yrs,
+  "SP.POP.DPND"= pre_treat_yrs,
+  "NE.GDI.FTOT.ZS"= pre_treat_yrs,
+  "GV.EXP.LOG" = pre_treat_yrs,
+  "IND.VAL.LOG"= pre_treat_yrs,
+  "SRV.VAL.LOG"= pre_treat_yrs,
+  "AGR.VAL.LOG"= pre_treat_yrs,
+  "NECON.LOG"= pre_treat_yrs,
+  "POP.LOG" = pre_treat_yrs
+)
+## MSCMT results
+agg.fns <- rep("mean", ncol(times.pred))
+gdpgr.mscmt <- mscmt(gdpgr.prep, treatment.identifiers, 
+                    control.identifiers, times.dep, times.pred, 
+                    agg.fns, seed = 1)
+
+```
+# Visualize the donor pool
+```{r}
+library(ggpubr)
+
+df <- data.frame(
+  country = c("Bosnia and Herzegovina", "Albania", "Ukraine", "North Macedonia"),
+  weight = c(51.2, 17.6, 16.3, 14.9)
+)
+
+df <- df %>%
+  mutate(label = paste0(country, " (", weight, "%)"))
+
+custom_colors <- c(
+  "Bosnia and Herzegovina (51.2%)" = "#99cc99",
+  "Albania (17.6%)" = "#d6eadf",
+  "Ukraine (16.3%)" = "#c5c5c5",
+  "North Macedonia (14.9%)" = "#666666"
+)
+
+ggplot(df, aes(x = "", y = weight, fill = label)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  theme_void() +
+  scale_fill_manual(values = custom_colors) +
+  theme(
+    panel.background = element_rect(fill = "transparent", color = NA), 
+    plot.background = element_rect(fill = "transparent", color = NA),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 17),  # ← Increase this value
+    legend.background = element_rect(fill = "transparent", color = NA)
+  )
+
+ggsave("pie_chart.png", bg = "transparent")
+
+```
+
+## Covariates Table
+
+```{r}
+cov.table<- gdpgr.mscmt$predictor.table
+rownames(cov.table) <- c("Current account balance (% of GDP)",
+                         "Unemployment, total (% of total labor force)",
+                         "Exports of goods and services (% of GDP)",
+                         "Imports of goods and services (% of GDP)", 
+                         "Foreign direct investment, net outflows (% of GDP)",
+                         "Foreign direct investment, net inflows (% of GDP)",
+                         "Employment in agriculture (% of total employment)",
+                         "Employment in industry (% of total employment)",
+                         "Employment in service (% of total employment)",
+                         "Adjusted net national income per capita (constant 2015 US$)",
+                         "School enrollment, tertiary (% gross)",
+                         "Gross savings (% of GDP)",
+                         "Trade (% of GDP)",
+                         "Age dependency ratio (% of working-age population)",
+                         "Gross fixed capital formation (% of GDP)",
+                         "General government expenditure (constant 2015 US$,log)",
+                         "Industry, value added (constant 2015 US$,log)",
+                         "Services, value added (constant 2015 US$,log)",
+                         "Agriculture, value added (constant 2015 US$,log)",
+                         "Households consumption expenditure (constant 2015 US$,log)",
+                         "Log Population")
+colnames(cov.table) <- c("Croatia", "Synthetic Croatia", "Sample Mean")
+cov.table
+
+```
+
+## Path Plot
+
+```{r}
+ggplot(gdpgr.mscmt, type = "comparison",treatment.time = 2004,
+       labels = c("Croatia","Synthetic Croatia"), col = c("lightgreen","darkgray")) +
+  ggtitle("Synth Path Plot of Economic Growth 1990-2023") +
+  xlab("Year") + ylab("Annual GDP Growth (%)") +
+  theme_minimal() 
+
+```
+
+## Gap Plot
+
+```{r}
+# Gap plot
+ggplot(gdpgr.mscmt, type = "gaps") +
+  ggtitle("Synth Gap Plot of Economic Growth 1990-2023") +
+  xlab("Years") + ylab("Gaps in Annual GDP Growth (%)") +
+  theme_minimal()
+# Calculate the pre- and post-treatment average effects
+gaps = gdpgr.mscmt$gaps$NY.GDP.MKTP.KD.ZG
+names(gaps) = seq(1990, 2023)
+gaps = gaps[!is.na(gaps)] 
+year_labels = as.numeric(names(gaps))
+pre_treat_gaps <- mean(gaps[year_labels < 2004]) 
+post_treat_gaps <- mean(gaps[year_labels >= 2004])
+cat("Average effect before treatment:", pre_treat_gaps, "\n")
+cat("Average effect after treatment:", post_treat_gaps, "\n")
+
+
+```
+## In-place Placebo Test
+# Gap plot
+```{r}
+# Placebo gap plot
+cl <- makeCluster(2)
+gdpgr_placebo <- mscmt(gdpgr.prep,
+                   treatment.identifiers,
+                   control.identifiers,
+                   times.dep, times.pred,
+                   agg.fns, cl = cl,
+                   placebo = T, seed = 1)
+stopCluster(cl)
+ggplot(gdpgr_placebo, treatment.time = 2004,
+       full.legend = F, labels = c("Croatia","Synthetic Croatia"), col = c("lightgreen","lightgray")) +
+  ggtitle("Annual GDP Growth Gaps in Croatia and Placebo Gaps 1990-2023") +
+  xlab("Years") + ylab("Gaps in Annual GDP Growth (%)") +
+  theme_minimal() 
+
+
+```
+
+# P-value
+```{r}
+# P-value for post-treatment period
+gdpgr_did <- did(gdpgr_placebo,
+                range.post = c(2005,2023),
+                alternative = "two.sided")
+gdpgr_did
+cat("P-value of the average effect 2005-2023:", gdpgr_did$p.value, "\n")
+
+```
+
+## Accession year
+```{r}
+## MSCMT results
+pre_treat_yrs2 <- seq(1990,2013,by=5)
+times.dep2 = cbind("NY.GDP.MKTP.KD.ZG" = pre_treat_yrs2)
+times.pred2 <- cbind(
+  "BN.CAB.XOKA.GD.ZS" = pre_treat_yrs2,
+  "SL.UEM.TOTL.NE.ZS" = pre_treat_yrs2,
+  "NE.EXP.GNFS.ZS" = pre_treat_yrs2,
+  "NE.IMP.GNFS.ZS" = pre_treat_yrs2,
+  "BM.KLT.DINV.WD.GD.ZS" = pre_treat_yrs2,
+  "BX.KLT.DINV.WD.GD.ZS" = pre_treat_yrs2,
+  "SL.AGR.EMPL.ZS"= pre_treat_yrs2,
+  "SL.IND.EMPL.ZS"= pre_treat_yrs2,
+  "SL.SRV.EMPL.ZS"= pre_treat_yrs2,
+  "NY.ADJ.NNTY.PC.KD"= pre_treat_yrs2,
+  "SE.TER.ENRR"= pre_treat_yrs2,
+  "NY.GNS.ICTR.ZS"= pre_treat_yrs2,
+  "NE.TRD.GNFS.ZS"= pre_treat_yrs2,
+  "SP.POP.DPND"= pre_treat_yrs2,
+  "NE.GDI.FTOT.ZS"= pre_treat_yrs2,
+  "GV.EXP.LOG" = pre_treat_yrs2,
+  "IND.VAL.LOG"= pre_treat_yrs2,
+  "SRV.VAL.LOG"= pre_treat_yrs2,
+  "AGR.VAL.LOG"= pre_treat_yrs2,
+  "NECON.LOG"= pre_treat_yrs2,
+  "POP.LOG" = pre_treat_yrs2
+)
+agg.fns2 <- rep("mean", ncol(times.pred2))
+gdpgr.mscmt2 <- mscmt(gdpgr.prep, treatment.identifiers, 
+                    control.identifiers, times.dep2, times.pred2, 
+                    agg.fns2, seed = 1)
+
+```
+
+# Synth Path
+```{r}
+ggplot(gdpgr.mscmt2, type = "comparison",treatment.time = 2013,
+       labels = c("Croatia","Synthetic Croatia"), col = c("lightgreen","darkgray"))+
+  ggtitle("Synth Path Plot of Economic Growth 1990-2023 (Accession)") +
+  xlab("Year") + ylab("Annual GDP Growth (%)") +
+  theme_minimal() 
+
+```
+
+# In-place placebo
+```{r}
+# Placebo gap plot
+cl <- makeCluster(2)
+gdpgr_placebo2 <- mscmt(gdpgr.prep,
+                   treatment.identifiers,
+                   control.identifiers,
+                   times.dep2, times.pred2,
+                   agg.fns2, cl = cl,
+                   placebo = T, seed = 1)
+stopCluster(cl)
+ggplot(gdpgr_placebo2, treatment.time = 2013) +
+  ggtitle("Annual GDP Growth Gaps in Croatia and Placebo Gaps 1990-2023") +
+  xlab("Years") + ylab("Gaps in Annual GDP Growth (%)") +
+  theme_minimal() 
+# P-value for post-treatment period
+gdpgr_did2 <- did(gdpgr_placebo2,
+                range.post = c(2014,2023),
+                alternative = "two.sided")
+gdpgr_did2
+cat("P-value of the average effect 2014-2023:", gdpgr_did2$p.value, "\n")
+
+```
+
